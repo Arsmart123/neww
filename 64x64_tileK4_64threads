@@ -1,0 +1,370 @@
+#include<iostream>
+using namespace std;
+#include <assert.h>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <stdlib.h>
+#include <vector>
+
+// CUDA runtime
+#include <cublas_v2.h>
+#include <cuda_runtime.h>
+#define SMEM_LDA (64)
+#define SMEM_LDB (64)
+#define SMEM_LDC (64)
+
+
+
+
+
+// remove original guard
+__device__ __forceinline__ void ldg32_nc_0(float &reg, const void *ptr) {
+	asm volatile("{mov.b32 %0, 0;\n"
+#if __CUDACC_VER_MAJOR__ >= 11 && __CUDACC_VER_MINOR__ >= 4 &&                 \
+    __CUDA_ARCH__ >= 750
+		"ld.global.nc.L2::128B.f32 %0, [%1];}\n"
+#else
+		"ld.global.nc.f32 %0, [%1];}\n"
+#endif
+		: "=f"(reg)
+		: "l"(ptr));
+}
+
+__device__ __forceinline__ uint32_t smem_u32addr(const void *smem_ptr) {
+	uint32_t addr;
+	asm("{.reg .u64 u64addr;\n"
+		" cvta.to.shared.u64 u64addr, %1;\n"
+		" cvt.u32.u64 %0, u64addr;}\n"
+		: "=r"(addr)
+		: "l"(smem_ptr));
+
+	return addr;
+}
+
+__device__ __forceinline__ void lds128(float &reg0, float &reg1, float &reg2,
+	float &reg3, const uint32_t &addr) {
+	asm volatile("ld.shared.v4.f32 {%0, %1, %2, %3}, [%4];\n"
+		: "=f"(reg0), "=f"(reg1), "=f"(reg2), "=f"(reg3)
+		: "r"(addr));
+}
+
+__device__ __forceinline__ void sts32(const float &reg, const uint32_t &addr) {
+	asm volatile("st.shared.f32 [%0], %1;\n" : : "r"(addr), "f"(reg));
+}
+
+/**
+ * version 12 相对于  version  11, 增加 subk 计算中的 ping-pong..此文件为修改A不需要转置，直接读取版本
+ */
+__global__ __launch_bounds__(64, 8) void sgemm_128x128x8(int m, int n, int k,
+	const float *a,
+	const float *b,
+	float *c) {
+	// 此处的64， 8的8存疑。。。可以再试试看
+	__shared__ __align__(4 * 1024) char smem[4 * 1024]; // 16KB shared memory for buffer （align的值可以和总缓冲内存大小匹配）
+
+	float *ashare = reinterpret_cast<float *>(smem);
+	float *bshare =
+		reinterpret_cast<float *>(smem + 2 * 1024); // 8k shared mem for B
+	float sum[8][8] = { 0 };
+	float panelA[2][8] = { 0 }, panelB[2][8] = { 0 };
+
+	int from_a = (threadIdx.x / 16) * m + blockIdx.y * 64 + threadIdx.x % 16;  // 注意此处是block.y，不像b是.x。以及(threadIdx.x / 32)所乘的是m
+	int from_b = (threadIdx.x / 16) * n + blockIdx.x * 64 + threadIdx.x % 16;
+
+	float a_ldg_reg[4], b_ldg_reg[4];
+
+	uint32_t b_sts_addr =
+		smem_u32addr(bshare + (threadIdx.x / 16) * 64 + (threadIdx.x % 16));
+	uint32_t a_sts_addr =
+		smem_u32addr(ashare + (threadIdx.x / 16) * 64 + (threadIdx.x % 16));
+
+	uint32_t aptr_base = smem_u32addr(ashare + (threadIdx.x / 8) * 4);
+	uint32_t bptr_base = smem_u32addr(bshare + (threadIdx.x % 8) * 4);  // 最大只需要到一半即可，因为panelA的时候是一次取8个，aptr_base只负责取左半边，右半边直接+64。
+
+	{
+		// load first
+		// load gmem to smem for ashare
+#pragma unroll
+		for (int i = 0; i < 4; ++i) {
+			//if (from_a + i * 16 < k*m) {
+			if (from_a + i * 16 < (1 + threadIdx.x / 16)*m && threadIdx.x / 16 < k) {
+				ldg32_nc_0(a_ldg_reg[i], (const char *)(a + from_a) + i * 16 * sizeof(float));
+				// 				if (a_ldg_reg[i] != 0){
+				//                     printf("a_ldg_reg[%d]=%f, threadIdx.x=%d  ", i, a_ldg_reg[i], threadIdx.x);
+				//                 }
+			}
+			else {
+				a_ldg_reg[i] = 0;
+			}  // 就是不知道用float4读会不会更快。。原来a是能够用float4的（float4有bank conflict，非转置能够合并读取
+		}
+#pragma unroll
+		for (int i = 0; i < 4; ++i) {
+			sts32(a_ldg_reg[i], a_sts_addr + i * 16 * sizeof(float));
+		}
+		// load gmem to smem for bshare
+#pragma unroll
+		for (int i = 0; i < 4; ++i) {
+			//if (from_b + i * 16 < k*n) {
+			if (from_b + i * 16 < (1 + threadIdx.x / 16)*n && threadIdx.x / 16 < k) {
+				ldg32_nc_0(b_ldg_reg[i], (const char *)(b + from_b) + i * 16 * sizeof(float));
+			}
+			else {
+				b_ldg_reg[i] = 0;
+			}
+		}
+#pragma unroll
+		for (int i = 0; i < 4; ++i) {
+			sts32(b_ldg_reg[i], b_sts_addr + i * 16 * sizeof(float));
+
+		}
+		__syncthreads();
+		// add offset and flip flag
+		from_a += 4 * m;
+		from_b += 4 * n;
+
+		a_sts_addr ^= 0x400;
+		b_sts_addr ^= 0x400;
+	}
+	//     if(threadIdx.x==0&&blockIdx.x==0){
+	//         for (int i=0; i<64; i++){
+	//             for(int j=0; j<4; j++){
+	//                 if (bshare[j*64+i] != 0){
+	//                     printf("bshare[%d][%d]=%f  ", j, i, bshare[j*64+i]);
+	//                 }
+	//             }
+	//         }
+	//         printf("\n");
+	//         for (int i=0; i<64; i++){
+	//             for(int j=0; j<4; j++){
+	//                 if (ashare[j*64+i] != 0){
+	//                     printf("ashare[%d][%d]=%f  ", j, i, ashare[j*64+i]);
+	//                 }
+	//             }
+	//         }
+	//         printf("\n");
+	//     }
+		// load fisrt panel
+	lds128(panelA[0][0], panelA[0][1], panelA[0][2], panelA[0][3], aptr_base);
+	lds128(panelA[0][4], panelA[0][5], panelA[0][6], panelA[0][7], aptr_base + 32 * sizeof(float));
+
+	lds128(panelB[0][0], panelB[0][1], panelB[0][2], panelB[0][3], bptr_base);
+	lds128(panelB[0][4], panelB[0][5], panelB[0][6], panelB[0][7], bptr_base + 32 * sizeof(float));
+	// 	if(threadIdx.x == 0 && blockIdx.x == 0){
+	//         for (int i=0;i<8; i++){
+	//             printf("panelA[0][%d]=%f  ", i, panelA[0][i]);
+	//         }
+	//         printf("\n");
+	//         for (int i=0;i<8; i++){
+	//             printf("panelB[0][%d]=%f  ", i, panelB[0][i]);
+	//         }
+	//         printf("\n");
+	// 	}
+	for (int loop = 0; loop < k; loop += 4) {
+		// calc
+#pragma unroll
+		for (int subk = 0; subk < 4; ++subk) {
+			if (3 == subk && loop < k - 4) {
+				// if have more, load next
+				for (int i = 0; i < 4; ++i) {
+					sts32(a_ldg_reg[i], a_sts_addr + i * 16 * sizeof(float));
+				}
+
+#pragma unroll
+				for (int i = 0; i < 4; ++i) {
+					sts32(b_ldg_reg[i], b_sts_addr + i * 16 * sizeof(float));
+				}
+				__syncthreads();
+				from_a += 4 * m;
+				from_b += 4 * n;
+
+				aptr_base ^= 0x400;
+				bptr_base ^= 0x400;
+				a_sts_addr ^= 0x400;
+				b_sts_addr ^= 0x400;
+			}
+
+			const int pp = (subk + 1) % 2; // ping-pong index
+			lds128(panelA[pp][0], panelA[pp][1], panelA[pp][2], panelA[pp][3],
+				aptr_base + ((subk + 1) % 4) * SMEM_LDA * sizeof(float));
+			lds128(panelA[pp][4], panelA[pp][5], panelA[pp][6], panelA[pp][7],
+				aptr_base + (((subk + 1) % 4) * SMEM_LDA + 32) * sizeof(float));
+
+			lds128(panelB[pp][0], panelB[pp][1], panelB[pp][2], panelB[pp][3],
+				bptr_base + ((subk + 1) % 4) * SMEM_LDB * sizeof(float));
+			lds128(panelB[pp][4], panelB[pp][5], panelB[pp][6], panelB[pp][7],
+				bptr_base + (((subk + 1) % 4) * SMEM_LDB + 32) * sizeof(float));
+			//             if(threadIdx.x == 0 && blockIdx.x == 0){
+			//                 for (int i=0;i<8; i++){
+			//                     printf("panelA[%d][%d]=%f  ", pp, i, panelA[pp][i]);
+			//                 }
+			//                 printf("\n");
+			//                 for (int i=0;i<8; i++){
+			//                     printf("panelB[%d][%d]=%f  ", pp, i, panelB[pp][i]);
+			//                 }
+			//                 printf("\n");
+			//             }
+			if (0 == subk && loop < k - 4) {
+#pragma unroll
+				for (int i = 0; i < 4; ++i) {
+					//if (from_a + i * 16 < k*m) {
+					if (from_a + i * 16 < (1 + threadIdx.x / 16)*m + (4 + loop)*m && threadIdx.x / 16 + loop + 4 < k) {
+						ldg32_nc_0(a_ldg_reg[i], (const char *)(a + from_a) + i * 16 * sizeof(float));
+					}
+					else {
+						a_ldg_reg[i] = 0;
+					}
+				}
+				// load gmem to smem for bshare
+#pragma unroll
+				for (int i = 0; i < 4; ++i) {
+					//if (from_b + i * 16 < k*n) {
+					if (from_b + i * 16 < (1 + threadIdx.x / 16)*n + (4 + loop)*n && threadIdx.x / 16 + loop + 4 < k) {
+						ldg32_nc_0(b_ldg_reg[i], (const char *)(b + from_b) + i * 16 * sizeof(float));
+					}
+					else {
+						b_ldg_reg[i] = 0;
+					}
+				}
+			}
+
+#pragma unroll
+			for (int i = 0; i < 8; ++i) {
+#pragma unroll
+				for (int j = 0; j < 8; ++j) {
+					sum[i][j] += panelA[subk % 2][i] * panelB[subk % 2][j];
+					// 					if(threadIdx.x == 0&&blockIdx.x==0 && sum[i][j]!=0){
+					// 					    printf("panelA[%d][%d]=%f, panelB[%d][%d]=%f, sum[%d][%d]=%f\n", subk % 2, i, panelA[subk % 2][i], subk % 2, j, panelB[subk % 2][j], i, j, sum[i][j]);
+					// 					}
+				}
+			}
+		}
+	}
+
+	int write_offset = (blockIdx.y * 64 + (threadIdx.x / 8) * 4) * n +
+		blockIdx.x * 64 + (threadIdx.x % 8) * 4;
+#pragma unroll
+	for (int i = 0; i < 4; ++i) {
+		for (int j = 0; j < 4; ++j) {
+			if (blockIdx.x * 64 + threadIdx.x % 8 * 4 + j < n && blockIdx.y * 64 + threadIdx.x / 8 * 4 + i < m) {
+				c[write_offset + i * n + j] = sum[i][j];
+				if (blockIdx.x * 64 + threadIdx.x % 8 * 4 + j + 32 < n && blockIdx.y * 64 + threadIdx.x / 8 * 4 + i + 32 < m) {
+					c[write_offset + (i + 32) * n + j + 32] = sum[i + 4][j + 4];  //如果最左上角的都不在了，那右下角的就根本不用考虑。
+				}
+			}
+			if (blockIdx.x * 64 + threadIdx.x % 8 * 4 + j + 32 < n && blockIdx.y * 64 + threadIdx.x / 8 * 4 + i < m) {
+				c[write_offset + i * n + j + 32] = sum[i][j + 4];
+			}
+			if (blockIdx.x * 64 + threadIdx.x % 8 * 4 + j < n && blockIdx.y * 64 + threadIdx.x / 8 * 4 + i + 32 < m) {
+				c[write_offset + (i + 32) * n + j] = sum[i + 4][j];
+			}
+		}
+	}
+}
+#undef SMEM_LDA
+#undef SMEM_LDB
+
+float* random_matrix(int row, int col) {
+	float* mat = new float[row * col];
+
+
+	for (int i = 0; i < row; ++i) {
+		for (int j = 0; j < col; ++j) {
+			if (i * col + j + 1 < 10) {
+				mat[i * col + j] = i * col + j + 1;
+			}
+			else {
+				mat[i * col + j] = 10;
+			}
+		}
+	}
+
+	return mat;
+}
+
+
+void print_mat(float* mat, int row, int col) {
+	/*Display the matrix for visualizatoin*/
+	for (int i = 0; i < row; ++i) {
+		for (int j = 0; j < col; ++j) {
+			cout << mat[i * col + j] << " ";
+		}cout << endl;
+	}
+	cout << "\n" << endl;
+}
+
+
+float* random_matrix_1(int row, int col) {
+	float* mat = new float[row * col];
+
+
+	for (int i = 0; i < row; ++i) {
+		for (int j = 0; j < col; ++j) {
+			mat[i * col + j] = 1;
+		}
+	}
+
+	return mat;
+}
+
+
+
+int main()
+{
+	const int m = 3072, k = 3072, n = 64;
+	float* a = random_matrix(k, m);
+	float* b = random_matrix(k, n);
+	float* c = new float[m * n];
+
+	float* dev_a, *dev_b, *dev_c;
+
+	cudaMalloc((void**)&dev_a, m * k * sizeof(float));
+	cudaMalloc((void**)&dev_b, k * n * sizeof(float));
+	cudaMalloc((void**)&dev_c, m * n * sizeof(float));
+
+	cudaMemcpy(dev_a, a, m * k * sizeof(float), cudaMemcpyHostToDevice);
+	cudaMemcpy(dev_b, b, k * n * sizeof(float), cudaMemcpyHostToDevice);
+
+
+	constexpr int BLOCK = 64;
+	dim3 grid((n + BLOCK - 1) / BLOCK, (m + BLOCK - 1) / BLOCK);
+	int repeat = 1;
+
+
+
+
+
+
+	cudaEvent_t start, stop;
+	cudaEventCreate(&start);
+	cudaEventCreate(&stop);
+	cudaEventRecord(start);
+	cudaEventQuery(start);
+
+	for (int i = 0; i < repeat; i++) {
+		sgemm_128x128x8 << <grid, 64 >> > (m, n, k, dev_a, dev_b, dev_c);
+	}
+
+
+
+
+
+	cudaEventRecord(stop);
+	cudaEventSynchronize(stop);
+	float elapsed_time;
+	cudaEventElapsedTime(&elapsed_time, start, stop);
+	printf("Time = %g ms .\n", elapsed_time / repeat);
+	cudaEventDestroy(start);
+	cudaEventDestroy(stop);
+
+
+	cudaMemcpy(c, dev_c, m*n * sizeof(float), cudaMemcpyDeviceToHost);
+
+	//cout << 'a' << endl;
+	//print_mat(a, k, m);
+	//cout << 'b' << endl;
+	//print_mat(b, k, n);
+	//cout << 'c' << endl;
+	//print_mat(c, m, n);
+}
